@@ -27,6 +27,48 @@ from config import (
     JPEG_QUALITY,
 )
 from audio import _speak_blocking, _play_audio
+import requests
+
+
+# =============================================================================
+# AUTH CACHE (for offline capability)
+# =============================================================================
+
+AUTH_CACHE_PATH = "/opt/aisee/.auth_cache"
+
+
+def save_auth_cache():
+    """Save verified auth state to disk after successful server check."""
+    import json
+    import os
+    try:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(AUTH_CACHE_PATH), exist_ok=True)
+        with open(AUTH_CACHE_PATH, "w") as f:
+            json.dump({"claimed": True, "timestamp": time.time()}, f)
+        print("✓ Auth state cached locally.")
+    except Exception as e:
+        print(f"⚠️  Could not save auth cache: {e}")
+
+
+def load_auth_cache() -> bool:
+    """Return True if device was previously verified, False if no cache exists."""
+    import json
+    try:
+        with open(AUTH_CACHE_PATH, "r") as f:
+            data = json.load(f)
+            return data.get("claimed", False)
+    except Exception:
+        return False
+
+
+def is_server_reachable(timeout: float = 3.0) -> bool:
+    """Check if the server is reachable."""
+    try:
+        requests.get(SERVER_URL, timeout=timeout)
+        return True
+    except Exception:
+        return False
 
 
 def check_device_setup() -> bool:

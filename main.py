@@ -38,7 +38,7 @@ from config import (
 )
 from detection import run_dual_detection, draw_detections
 from tracking import expire_lost_tracks, process_detections, clear_track_states, trigger_manual_scan
-from ocr import check_device_setup, wait_for_setup, run_ocr_pipeline
+from ocr import check_device_setup, wait_for_setup, run_ocr_pipeline, save_auth_cache, load_auth_cache, is_server_reachable
 from audio import (
     start_speech_worker,
     stop_speech_worker,
@@ -94,13 +94,24 @@ def main():
     print("=" * 60 + "\n")
 
     # ------------------------------------------------------------------
-    # STEP 1 — Check device setup
+    # STEP 1 — Check device setup (with offline support)
     # ------------------------------------------------------------------
     print(f"🔍 Checking device setup (code: {DEVICE_CODE})...")
-    if not check_device_setup():
-        wait_for_setup()
+    
+    server_ok = check_device_setup()
+
+    if server_ok:
+        # Online and verified — update the local cache
+        save_auth_cache()
+        print("✓ Device verified with server.\n")
+    elif load_auth_cache():
+        # Offline but previously verified — allow OD, warn about OCR
+        print("⚠️  Server unreachable, using cached auth. OCR unavailable offline.\n")
+        _speak_blocking("Internet unavailable. Object detection running. Text reading unavailable.")
     else:
-        print("✓ Device is set up and active!\n")
+        # Never been verified and offline — must set up first
+        print("⚠️  Device not set up and server unreachable.\n")
+        wait_for_setup()
 
     # ------------------------------------------------------------------
     # STEP 2 — Open camera
@@ -194,6 +205,12 @@ def main():
         if ocr_processing.is_set():
             print("⚠️  Already processing — please wait.\n")
             announce("Already processing, please wait")
+            return
+
+        # Check internet before attempting OCR
+        if not is_server_reachable():
+            print("❌ No internet — OCR unavailable.")
+            _speak_blocking("No internet connection. Text reading is unavailable.")
             return
 
         frame = latest_frame[0]
