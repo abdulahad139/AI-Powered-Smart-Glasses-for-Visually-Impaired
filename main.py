@@ -1,245 +1,279 @@
-import pyttsx3
-from threading import Thread
-from queue import Queue
-import cv2
-import numpy as np
+# =============================================================================
+# Main — Smart Glasses entry point with GPIO and camera loop
+# =============================================================================
+#
+# Integrates all modules: config, detection, tracking, distance, OCR, audio.
+# Handles GPIO buttons, camera capture, and the main processing loop.
+#
+# =============================================================================
+
+import os
+import sys
 import time
-from ultralytics import YOLO
+import threading
 
-# Define absolute paths
-MODEL_PATH = r"best.pt"
-VIDEO_PATH = r"Fahad.mp4"
+# Try imports, install if missing
+try:
+    import cv2
+    import RPi.GPIO as GPIO
+except ImportError:
+    print("Installing required packages...")
+    os.system(
+        'pip install --quiet '
+        'requests gTTS Pillow opencv-python '
+        'pyttsx3 ultralytics RPi.GPIO'
+    )
+    print("✓ Packages installed! Please run the script again.\n")
+    sys.exit(0)
 
-# Cooldown and distance tracking
-last_spoken = {}
-last_distances = {}
-speech_cooldown = 3  # Reduced to 3 seconds for testing
+# Import all modules
+from config import (
+    SERVER_URL,
+    DEVICE_CODE,
+    CAMERA_INDEX,
+    CAMERA_WARMUP_FRAMES,
+    BUTTONS,
+    BUTTON_BOUNCETIME,
+    OD_FRAME_SKIP,
+)
+from detection import run_dual_detection, draw_detections
+from tracking import expire_lost_tracks, process_detections, clear_track_states, trigger_manual_scan
+from ocr import check_device_setup, wait_for_setup, run_ocr_pipeline
+from audio import (
+    start_speech_worker,
+    stop_speech_worker,
+    announce,
+    speech_queue,
+    _speak_blocking,
+)
 
-# Queue for speech
-speech_queue = Queue()
 
-def speak_worker():
-    """TTS worker thread - creates new engine for each message"""
-    while True:
-        try:
-            if not speech_queue.empty():
-                item = speech_queue.get(timeout=1)
-                if item is None:  # Shutdown signal
-                    break
-                    
-                label, distance, position = item
-                current_time = time.time()
-                rounded_distance = round(distance * 2) / 2
-                distance_str = str(int(rounded_distance)) if rounded_distance.is_integer() else str(rounded_distance)
+# =============================================================================
+# SHARED STATE
+# =============================================================================
 
-                # Cooldown to prevent flooding
-                if label in last_spoken and current_time - last_spoken[label] < speech_cooldown:
-                    print(f"Skipping {label} due to cooldown")
-                    continue
+current_mode   = ['od']           # 'od' or 'ocr'
+ocr_processing = threading.Event()
 
-                # Determine motion direction
-                prev_distance = last_distances.get(label, None)
-                if prev_distance is not None:
-                    if distance < prev_distance - 0.3:
-                        motion = "approaching"
-                    elif distance > prev_distance + 0.3:
-                        motion = "going away"
-                    else:
-                        motion = "ahead"
-                else:
-                    motion = "ahead"
 
-                if distance <= 2:
-                    motion = "very close"
+# =============================================================================
+# OVERLAY
+# =============================================================================
 
-                last_distances[label] = distance
+def draw_overlay(frame, mode, ocr_busy):
+    """Draw HUD bar at bottom of frame showing current mode and controls."""
+    display = frame.copy()
+    h, w    = display.shape[:2]
+    overlay = display.copy()
+    cv2.rectangle(overlay, (0, h - 45), (w, h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.6, display, 0.4, 0, display)
 
-                # Create message and speak it
-                message = f"{label} is {distance_str} meters on your {position}, {motion}"
-                print(f"Speaking: {message}")
-                
-                # Create new TTS engine for each message (fixes pyttsx3 threading issues)
-                try:
-                    tts_engine = pyttsx3.init()
-                    tts_engine.setProperty('rate', 235)
-                    tts_engine.setProperty('volume', 1.0)
-                    tts_engine.say(message)
-                    tts_engine.runAndWait()
-                    tts_engine.stop()
-                    del tts_engine
-                except Exception as tts_error:
-                    print(f"TTS Error: {tts_error}")
-
-                last_spoken[label] = current_time
-
-                # Clear any backlog in queue
-                while not speech_queue.empty():
-                    try:
-                        speech_queue.get_nowait()
-                        print("Cleared backlogged message")
-                    except:
-                        break
-            else:
-                time.sleep(0.1)
-        except Exception as e:
-            print(f"Speaker thread error: {e}")
-            time.sleep(0.1)
-
-# Calculate distance
-def calculate_distance(box, frame_width, label):
-    object_width = box.xyxy[0, 2].item() - box.xyxy[0, 0].item()
-    if label in class_avg_sizes:
-        object_width *= class_avg_sizes[label]["width_ratio"]
-    distance = (frame_width * 0.5) / np.tan(np.radians(70 / 2)) / (object_width + 1e-6)
-    return round(distance, 2)
-
-# Get object position
-def get_position(frame_width, box):
-    if box[0] < frame_width // 3:
-        return "left"
-    elif box[0] < 2 * (frame_width // 3):
-        return "center"
+    if mode == 'od':
+        text  = "MODE: Dual OD  |  [P]=Pretrained  [C]=Custom  [T]=Tracked  |  BTN1: OCR  |  ESC: Quit"
+        color = (0, 200, 255)
+    elif ocr_busy:
+        text  = "MODE: OCR  |  Processing... Please wait"
+        color = (0, 0, 255)
     else:
-        return "right"
+        text  = "MODE: OCR  |  BTN2: Scan  |  BTN1: Toggle to OD  |  ESC: Quit"
+        color = (0, 220, 0)
 
-# Blur region
-def blur_person(image, box):
-    x, y, w, h = box.xyxy[0].cpu().numpy().astype(int)
-    top_region = image[y:y+int(0.08 * h), x:x+w]
-    blurred_top_region = cv2.GaussianBlur(top_region, (15, 15), 0)
-    image[y:y+int(0.08 * h), x:x+w] = blurred_top_region
-    return image
+    cv2.putText(display, text, (10, h - 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2)
+    return display
 
-# Object widths
-class_avg_sizes = {
-    "person": {"width_ratio": 2.5},
-    "car": {"width_ratio": 0.37},
-    "bicycle": {"width_ratio": 2.3},
-    "motorcycle": {"width_ratio": 2.4},
-    "bus": {"width_ratio": 0.3},
-    "traffic light": {"width_ratio": 2.95},
-    "stop sign": {"width_ratio": 2.55},
-    "bench": {"width_ratio": 1.6},
-    "cat": {"width_ratio": 1.9},
-    "dog": {"width_ratio": 1.5},
-}
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
-    # Initialize startup TTS
-    try:
-        startup_engine = pyttsx3.init()
-        startup_engine.setProperty('rate', 235)
-        startup_engine.setProperty('volume', 1.0)
-        startup_engine.say("System activated")
-        startup_engine.runAndWait()
-        startup_engine.stop()
-        del startup_engine
-    except Exception as e:
-        print(f"Startup TTS error: {e}")
-    
-    # Start TTS thread
-    tts_thread = Thread(target=speak_worker, daemon=True)
-    tts_thread.start()
-    
-    # Load model and video
-    try:
-        model = YOLO(MODEL_PATH)
-        cap = cv2.VideoCapture(VIDEO_PATH)
-    except Exception as e:
-        print(f"Error loading model or video: {e}")
-        return
-    
-    if not cap.isOpened():
-        print("Error: Could not open video file")
-        return
-    
-    # Output video setup
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter('output_with_boxes.avi', fourcc, 20.0, 
-                         (int(cap.get(3)), int(cap.get(4))))
-    
-    pause = False
-    frame_count = 0
-    
-    try:
-        while cap.isOpened():
-            if not pause:
-                ret, frame = cap.read()
-                if not ret:
-                    print("End of video or failed to read frame")
+    print("\n" + "=" * 60)
+    print("  AiSee Smart Glasses — Dual Model OD + Urdu OCR + Distance")
+    print("  (Modular version)")
+    print("=" * 60 + "\n")
+
+    # ------------------------------------------------------------------
+    # STEP 1 — Check device setup
+    # ------------------------------------------------------------------
+    print(f"🔍 Checking device setup (code: {DEVICE_CODE})...")
+    if not check_device_setup():
+        wait_for_setup()
+    else:
+        print("✓ Device is set up and active!\n")
+
+    # ------------------------------------------------------------------
+    # STEP 2 — Open camera
+    # ------------------------------------------------------------------
+    print(f"📷 Opening camera (index {CAMERA_INDEX})...")
+    cam = cv2.VideoCapture(CAMERA_INDEX)
+    cam.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    if not cam.isOpened():
+        print("❌ Could not open camera.")
+        sys.exit(1)
+
+    print(f"   Warming up ({CAMERA_WARMUP_FRAMES} frames)...")
+    for _ in range(CAMERA_WARMUP_FRAMES):
+        cam.read()
+    print("✓ Camera ready!\n")
+
+    # ------------------------------------------------------------------
+    # STEP 3 — Start TTS worker thread
+    # ------------------------------------------------------------------
+    print("🎤 Starting speech worker...")
+    tts_thread = start_speech_worker()
+    print("✓ Speech worker started!\n")
+
+    # ------------------------------------------------------------------
+    # STEP 4 — Startup announcement
+    # ------------------------------------------------------------------
+    _speak_blocking("System activated. Dual model object detection with distance estimation running.")
+
+    # ------------------------------------------------------------------
+    # STEP 5 — Display window
+    # ------------------------------------------------------------------
+    cv2.namedWindow("AiSee Smart Glasses", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("AiSee Smart Glasses", 640, 480)
+
+    print("=" * 60)
+    print("  ✅ System ready!")
+    print(f"  Button 1 (GPIO {BUTTONS['Button 1']}) — Toggle OD ↔ OCR")
+    print(f"  Button 2 (GPIO {BUTTONS['Button 2']}) — Manual scan (OD) / Capture (OCR)")
+    print("  ESC key            — Quit")
+    print("  Bounding boxes:    Blue=[P] Pretrained   Orange=[C] Custom   Tracked=[T]")
+    print("  Distance shown in label when calibrated, e.g. '[C] chair (0.72) 1.4m'")
+    print("  Settled tracks go silent after 3 announcements until distance changes")
+    print("=" * 60 + "\n")
+
+    # ------------------------------------------------------------------
+    # STEP 6 — GPIO setup
+    # ------------------------------------------------------------------
+
+    latest_frame = [None]
+
+    def on_mode_toggle(channel=None):
+        """Button 1 — Toggle between OD and OCR."""
+        if current_mode[0] == 'od':
+            current_mode[0] = 'ocr'
+            # Clear speech queue when switching modes
+            while not speech_queue.empty():
+                try:
+                    speech_queue.get_nowait()
+                except Exception:
                     break
-                
-                frame_count += 1
-                
-                # Process every 5th frame to reduce load
-                if frame_count % 5 == 0:
-                    try:
-                        results = model.predict(frame, verbose=False)
-                        result = results[0]
-                        nearest_object = None
-                        min_distance = float('inf')
-        
-                        for box in result.boxes:
-                            label = result.names[box.cls[0].item()]
-                            cords = [round(x) for x in box.xyxy[0].tolist()]
-                            distance = calculate_distance(box, frame.shape[1], label)
-        
-                            if distance < min_distance:
-                                min_distance = distance
-                                nearest_object = (label, round(distance, 1), cords)
-        
-                            if label == "person":
-                                frame = blur_person(frame, box)
-                                color = (0, 255, 0)
-                            elif label == "car":
-                                color = (0, 255, 255)
-                            elif label in class_avg_sizes:
-                                color = (255, 0, 0)
-                            else:
-                                print(label)
-                                #continue
-        
-                            cv2.rectangle(frame, (cords[0], cords[1]), (cords[2], cords[3]), color, 2)
-                            cv2.putText(frame, f"{label} - {distance:.1f}m", 
-                                      (cords[0], cords[1] - 10), 
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        
-                        # Add to speech queue if object is close enough
-                        if nearest_object and nearest_object[1] <= 12.5:
-                            position = get_position(frame.shape[1], nearest_object[2])
-                            print(f"Detected: {nearest_object[0]} at {nearest_object[1]}m on {position}")
-                            
-                            # Only add if queue is not too full
-                            if speech_queue.qsize() < 2:
-                                speech_queue.put((nearest_object[0], nearest_object[1], position))
-                                print(f"Added to speech queue")
-                            else:
-                                print("Speech queue full, skipping")
-                    except Exception as e:
-                        print(f"Detection error: {e}")
-    
-                cv2.imshow('Audio World', frame)
-                out.write(frame)
-    
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                print("Quitting...")
+            print("\n🔀 Switched to OCR mode — press Button 2 to scan\n")
+            announce("OCR mode activated")
+        else:
+            if ocr_processing.is_set():
+                print("⚠️  OCR still running — please wait.\n")
+                announce("Please wait, scan in progress")
+                return
+            current_mode[0] = 'od'
+            print("\n🔀 Switched to Object Detection mode\n")
+            announce("Object detection resumed")
+
+    def on_capture(channel=None):
+        """Button 2 — Manual scan in OD mode, OCR capture in OCR mode."""
+        if current_mode[0] == 'od':
+            # OD mode: trigger manual scan
+            print("\n🔘 Manual scan triggered (Button 2)")
+            announce("Manual scan")
+            # Get current detections from the last inference
+            if last_detections:
+                trigger_manual_scan(last_detections, 640)  # frame width is 640
+            else:
+                # Run inference immediately if no recent detections
+                temp_dets = run_dual_detection(latest_frame[0])
+                trigger_manual_scan(temp_dets, 640)
+            return
+
+        # OCR mode: capture frame and send to server
+        if ocr_processing.is_set():
+            print("⚠️  Already processing — please wait.\n")
+            announce("Already processing, please wait")
+            return
+
+        frame = latest_frame[0]
+        if frame is None:
+            print("⚠️  No frame available yet.")
+            return
+
+        ocr_processing.set()
+        announce("Image captured, processing")
+
+        def pipeline():
+            try:
+                run_ocr_pipeline(frame.copy())
+            finally:
+                ocr_processing.clear()
+
+        threading.Thread(target=pipeline, daemon=True).start()
+
+    # GPIO init
+    GPIO.setmode(GPIO.BCM)
+    for name, pin in BUTTONS.items():
+        GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        print(f"✓ {name} registered on GPIO {pin}")
+
+    GPIO.add_event_detect(BUTTONS["Button 1"], GPIO.FALLING,
+                          callback=on_mode_toggle, bouncetime=BUTTON_BOUNCETIME)
+    GPIO.add_event_detect(BUTTONS["Button 2"], GPIO.FALLING,
+                          callback=on_capture, bouncetime=BUTTON_BOUNCETIME)
+    print("✓ GPIO buttons active\n")
+
+    # ------------------------------------------------------------------
+    # STEP 7 — Main frame loop
+    # ------------------------------------------------------------------
+    frame_count     = 0
+    last_detections = []   # Reused between skipped frames — prevents box flicker
+
+    try:
+        while True:
+            ret, frame = cam.read()
+            if not ret:
+                print("❌ Lost camera feed.")
                 break
-            elif key == ord('p'):
-                pause = not pause
-                print(f"Paused: {pause}")
-                
+
+            frame_count += 1
+            latest_frame[0] = frame.copy()
+
+            if current_mode[0] == 'od':
+                if frame_count % OD_FRAME_SKIP == 0:
+                    # Run both models with tracking
+                    last_detections = run_dual_detection(frame)
+
+                    # Expire stale tracks, then decide what to announce
+                    expire_lost_tracks()
+                    process_detections(last_detections, frame.shape[1])
+            else:
+                # In OCR mode — clear detections so boxes don't linger
+                last_detections = []
+
+            # Draw boxes every frame for smooth visuals
+            frame = draw_detections(frame, last_detections)
+
+            display_frame = draw_overlay(frame, current_mode[0], ocr_processing.is_set())
+            cv2.imshow("AiSee Smart Glasses", display_frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:   # ESC
+                print("\n🛑 ESC pressed — shutting down...")
+                break
+
     except KeyboardInterrupt:
-        print("Interrupted by user")
+        print("\n⚠️  Interrupted by user.")
+
     finally:
-        # Cleanup
-        print("Shutting down...")
-        speech_queue.put(None)  # Signal TTS thread to stop
-        time.sleep(1)  # Give it time to finish
-        cap.release()
-        out.release()
+        print("Cleaning up...")
+        stop_speech_worker()
+        GPIO.cleanup()
+        cam.release()
         cv2.destroyAllWindows()
-        print("Cleanup complete")
+        print("✓ Done. Goodbye!\n")
+
 
 if __name__ == "__main__":
     main()
