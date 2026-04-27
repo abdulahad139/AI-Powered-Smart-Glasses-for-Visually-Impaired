@@ -2,20 +2,34 @@
 # Audio — Text-to-speech and audio playback utilities
 # =============================================================================
 #
-# Handles all audio output: TTS engine, speech worker thread, and audio playback.
+# Handles all audio output: TTS engine (Piper), speech worker thread, and audio playback.
 #
 # =============================================================================
 
 import os
 import time
 import threading
+import subprocess
+import tempfile
 from queue import Queue
 
-import pyttsx3
+from config import PIPER_MODEL_PATH, BT_DEVICE
 
 
 # Shared speech queue for cross-module communication
 speech_queue = Queue()
+
+# Lazy-loaded Piper voice
+_piper_voice = None
+
+
+def _get_piper_voice():
+    """Lazy-load the Piper voice."""
+    global _piper_voice
+    if _piper_voice is None:
+        from piper.voice import PiperVoice
+        _piper_voice = PiperVoice.load(PIPER_MODEL_PATH)
+    return _piper_voice
 
 
 def _play_audio(path: str):
@@ -31,18 +45,47 @@ def _play_audio(path: str):
     print("⚠️  No audio player found. Run: sudo apt install mpg123")
 
 
-def _speak_blocking(text: str, lang: str = "en"):
-    """Speak English text immediately using pyttsx3 (blocking)."""
+def _speak_piper(text: str):
+    """
+    Speak text using Piper TTS.
+    Synthesizes speech to a temporary WAV file and plays it via paplay.
+    """
     try:
-        engine = pyttsx3.init()
-        engine.setProperty('rate', 235)
-        engine.setProperty('volume', 1.0)
-        engine.say(text)
-        engine.runAndWait()
-        engine.stop()
-        del engine
+        voice = _get_piper_voice()
+        
+        # Synthesize to temporary WAV file
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_path = f.name
+
+        # Synthesize audio
+        chunks = list(voice.synthesize(text))
+        
+        # Write WAV file
+        import wave
+        with wave.open(tmp_path, "wb") as wav_file:
+            wav_file.setnchannels(chunks[0].sample_channels)
+            wav_file.setsampwidth(chunks[0].sample_width)
+            wav_file.setframerate(chunks[0].sample_rate)
+            for chunk in chunks:
+                wav_file.writeframes(chunk.audio_int16_bytes)
+
+        # Play via paplay (with optional Bluetooth device)
+        if BT_DEVICE:
+            subprocess.run(["paplay", f"--device={BT_DEVICE}", tmp_path], check=True)
+        else:
+            subprocess.run(["paplay", tmp_path], check=True)
+
+        # Cleanup
+        os.unlink(tmp_path)
+        
     except Exception as e:
-        print(f"⚠️  TTS error: {e}")
+        print(f"⚠️  Piper TTS error: {e}")
+
+
+# Backward compatibility alias
+def _speak_blocking(text: str, lang: str = "en"):
+    """Speak English text immediately using Piper (blocking)."""
+    _speak_piper(text)
 
 
 def speak_worker():
@@ -87,14 +130,9 @@ def speak_worker():
                         except Exception:
                             break
 
+                # Use Piper TTS
                 try:
-                    engine = pyttsx3.init()
-                    engine.setProperty('rate', 220)
-                    engine.setProperty('volume', 1.0)
-                    engine.say(message)
-                    engine.runAndWait()
-                    engine.stop()
-                    del engine
+                    _speak_piper(message)
                 except Exception as e:
                     print(f"⚠️  TTS error: {e}")
 

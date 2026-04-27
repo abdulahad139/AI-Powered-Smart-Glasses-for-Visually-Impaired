@@ -177,3 +177,14 @@ SETTLE_ANNOUNCE_COUNT = 3
 # Minimum distance change (metres) to wake up a settled track.
 # If a settled track's distance changes by more than this, it becomes active again.
 SETTLE_WAKEUP_DELTA = 0.8
+
+# =============================================================================
+# TTS CONFIGURATION (Piper)
+# =============================================================================
+
+# Piper TTS model path
+PIPER_MODEL_PATH = "/home/ab/Desktop/final script/en_US-amy-medium.onnx"
+
+# Bluetooth audio device for pipel (leave empty for default device)
+# Format: "bluez_output.XX_XX_XX_XX_XX_XX.1"
+BT_DEVICE = ""
