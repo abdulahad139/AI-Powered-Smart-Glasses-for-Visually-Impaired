@@ -81,7 +81,6 @@ COLOR_CUSTOM     = (  0, 165, 255)   # Orange
 # =============================================================================
 
 OD_FRAME_SKIP   = 5    # Run inference every Nth frame
-SPEECH_COOLDOWN = 3    # Seconds before same label is announced again
 MAX_QUEUE_SIZE  = 2    # Max queued speech items before dropping
 
 # =============================================================================

@@ -5,11 +5,15 @@
 # Integrates all modules: config, detection, tracking, distance, OCR, audio.
 # Handles GPIO buttons, camera capture, and the main processing loop.
 #
+# OCR uses Google Drive API directly on the Pi (no AiSee server needed).
+# OD always starts regardless of internet or Drive auth state.
+#
 # =============================================================================
 
 import os
 import sys
 import time
+import socket
 import threading
 
 # Try imports, install if missing
@@ -21,15 +25,13 @@ except ImportError:
     os.system(
         'pip install --quiet '
         'requests gTTS Pillow opencv-python '
-        'piper-tts ultralytics RPi.GPIO'
+        'pyttsx3 ultralytics RPi.GPIO '
+        'google-api-python-client google-auth-oauthlib'
     )
     print("✓ Packages installed! Please run the script again.\n")
     sys.exit(0)
 
-# Import all modules
 from config import (
-    SERVER_URL,
-    DEVICE_CODE,
     CAMERA_INDEX,
     CAMERA_WARMUP_FRAMES,
     BUTTONS,
@@ -37,8 +39,13 @@ from config import (
     OD_FRAME_SKIP,
 )
 from detection import run_dual_detection, draw_detections
-from tracking import expire_lost_tracks, process_detections, clear_track_states, trigger_manual_scan
-from ocr import check_device_setup, wait_for_setup, run_ocr_pipeline, save_auth_cache, load_auth_cache, is_server_reachable
+from tracking import (
+    expire_lost_tracks,
+    process_detections,
+    clear_track_states,
+    trigger_manual_scan,
+)
+from ocr import get_drive_service, run_ocr_pipeline
 from audio import (
     start_speech_worker,
     stop_speech_worker,
@@ -52,15 +59,34 @@ from audio import (
 # SHARED STATE
 # =============================================================================
 
-current_mode   = ['od']           # 'od' or 'ocr'
+current_mode   = ['od']   # 'od' or 'ocr'
 ocr_processing = threading.Event()
+ocr_available  = [False]  # True only if Google Drive authenticated successfully
+
+
+# =============================================================================
+# CONNECTIVITY HELPER
+# =============================================================================
+
+def is_google_reachable(timeout: float = 3.0) -> bool:
+    """
+    Check if Google APIs are reachable.
+    Used before OCR capture to catch mid-session connectivity loss.
+    """
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.connect(("www.googleapis.com", 443))
+        socket.close()
+        return True
+    except OSError:
+        return False
 
 
 # =============================================================================
 # OVERLAY
 # =============================================================================
 
-def draw_overlay(frame, mode, ocr_busy):
+def draw_overlay(frame, mode, ocr_busy, ocr_ok):
     """Draw HUD bar at bottom of frame showing current mode and controls."""
     display = frame.copy()
     h, w    = display.shape[:2]
@@ -69,7 +95,8 @@ def draw_overlay(frame, mode, ocr_busy):
     cv2.addWeighted(overlay, 0.6, display, 0.4, 0, display)
 
     if mode == 'od':
-        text  = "MODE: Dual OD  |  [P]=Pretrained  [C]=Custom  [T]=Tracked  |  BTN1: OCR  |  ESC: Quit"
+        ocr_hint = "BTN1: OCR" if ocr_ok else "BTN1: OCR (unavailable)"
+        text  = f"MODE: Dual OD  |  [P]=Pretrained  [C]=Custom  |  {ocr_hint}  |  BTN2: Scan  |  ESC: Quit"
         color = (0, 200, 255)
     elif ocr_busy:
         text  = "MODE: OCR  |  Processing... Please wait"
@@ -89,29 +116,28 @@ def draw_overlay(frame, mode, ocr_busy):
 
 def main():
     print("\n" + "=" * 60)
-    print("  AiSee Smart Glasses — Dual Model OD + Urdu OCR + Distance")
-    print("  (Modular version)")
+    print("  AiSee Smart Glasses — Dual Model OD + Edge OCR + Distance")
     print("=" * 60 + "\n")
 
     # ------------------------------------------------------------------
-    # STEP 1 — Check device setup (with offline support)
+    # STEP 1 — Check Google Drive authentication
+    # OD always starts regardless of this result.
+    # OCR is only enabled if Drive auth succeeds.
     # ------------------------------------------------------------------
-    print(f"🔍 Checking device setup (code: {DEVICE_CODE})...")
-    
-    server_ok = check_device_setup()
+    print("🔐 Checking Google Drive authentication...")
+    drive_service = get_drive_service()
 
-    if server_ok:
-        # Online and verified — update the local cache
-        save_auth_cache()
-        print("✓ Device verified with server.\n")
-    elif load_auth_cache():
-        # Offline but previously verified — allow OD, warn about OCR
-        print("⚠️  Server unreachable, using cached auth. OCR unavailable offline.\n")
-        _speak_blocking("Internet unavailable. Object detection running. Text reading unavailable.")
+    if drive_service:
+        ocr_available[0] = True
+        print("✓ Google Drive authenticated. OCR available.\n")
     else:
-        # Never been verified and offline — must set up first
-        print("⚠️  Device not set up and server unreachable.\n")
-        wait_for_setup()
+        ocr_available[0] = False
+        print("⚠️  Google Drive not authenticated. OCR unavailable.\n")
+        _speak_blocking(
+            "Text reading unavailable. "
+            "Google Drive credentials not set up. "
+            "Object detection is running."
+        )
 
     # ------------------------------------------------------------------
     # STEP 2 — Open camera
@@ -135,13 +161,13 @@ def main():
     # STEP 3 — Start TTS worker thread
     # ------------------------------------------------------------------
     print("🎤 Starting speech worker...")
-    tts_thread = start_speech_worker()
+    start_speech_worker()
     print("✓ Speech worker started!\n")
 
     # ------------------------------------------------------------------
     # STEP 4 — Startup announcement
     # ------------------------------------------------------------------
-    _speak_blocking("System activated. Dual model object detection with distance estimation running.")
+    _speak_blocking("System activated. Object detection running.")
 
     # ------------------------------------------------------------------
     # STEP 5 — Display window
@@ -153,30 +179,51 @@ def main():
     print("  ✅ System ready!")
     print(f"  Button 1 (GPIO {BUTTONS['Button 1']}) — Toggle OD ↔ OCR")
     print(f"  Button 2 (GPIO {BUTTONS['Button 2']}) — Manual scan (OD) / Capture (OCR)")
-    print("  ESC key            — Quit")
-    print("  Bounding boxes:    Blue=[P] Pretrained   Orange=[C] Custom   Tracked=[T]")
-    print("  Distance shown in label when calibrated, e.g. '[C] chair (0.72) 1.4m'")
-    print("  Settled tracks go silent after 3 announcements until distance changes")
+    print(f"  OCR available: {ocr_available[0]}")
+    print("  ESC key — Quit")
     print("=" * 60 + "\n")
 
     # ------------------------------------------------------------------
     # STEP 6 — GPIO setup
     # ------------------------------------------------------------------
 
-    latest_frame = [None]
+    latest_frame    = [None]
+    last_detections = []
 
     def on_mode_toggle(channel=None):
-        """Button 1 — Toggle between OD and OCR."""
+        """
+        Button 1 — Toggle between OD and OCR.
+        If Google Drive auth failed or no internet, stays in OD and tells user.
+        """
         if current_mode[0] == 'od':
+            # Block switch if OCR is not available
+            if not ocr_available[0]:
+                print("⚠️  OCR unavailable — Google Drive not authenticated.")
+                _speak_blocking(
+                    "Text reading is unavailable. "
+                    "Please set up Google Drive credentials and restart."
+                )
+                return
+
+            # OCR available but check connectivity before switching
+            if not is_google_reachable():
+                print("⚠️  OCR unavailable — no internet connection.")
+                _speak_blocking(
+                    "Text reading is unavailable. "
+                    "Please connect to Wi-Fi to use this feature."
+                )
+                return
+
             current_mode[0] = 'ocr'
-            # Clear speech queue when switching modes
             while not speech_queue.empty():
                 try:
                     speech_queue.get_nowait()
                 except Exception:
                     break
+            clear_track_states()
             print("\n🔀 Switched to OCR mode — press Button 2 to scan\n")
             announce("OCR mode activated")
+
         else:
             if ocr_processing.is_set():
                 print("⚠️  OCR still running — please wait.\n")
@@ -189,28 +236,32 @@ def main():
     def on_capture(channel=None):
         """Button 2 — Manual scan in OD mode, OCR capture in OCR mode."""
         if current_mode[0] == 'od':
-            # OD mode: trigger manual scan
             print("\n🔘 Manual scan triggered (Button 2)")
-            announce("Manual scan")
-            # Get current detections from the last inference
+            announce("Scanning")
+            frame_width = latest_frame[0].shape[1] if latest_frame[0] is not None else 640
             if last_detections:
-                trigger_manual_scan(last_detections, 640)  # frame width is 640
-            else:
-                # Run inference immediately if no recent detections
+                trigger_manual_scan(last_detections, frame_width)
+            elif latest_frame[0] is not None:
                 temp_dets = run_dual_detection(latest_frame[0])
-                trigger_manual_scan(temp_dets, 640)
+                trigger_manual_scan(temp_dets, frame_width)
+            else:
+                announce("No objects currently detected")
             return
 
-        # OCR mode: capture frame and send to server
+        # OCR mode
         if ocr_processing.is_set():
             print("⚠️  Already processing — please wait.\n")
             announce("Already processing, please wait")
             return
 
-        # Check internet before attempting OCR
-        if not is_server_reachable():
+        # Re-check Google connectivity at capture time
+        # (connection may have dropped mid-session after mode switch)
+        if not is_google_reachable():
             print("❌ No internet — OCR unavailable.")
-            _speak_blocking("No internet connection. Text reading is unavailable.")
+            _speak_blocking(
+                "No internet connection. "
+                "Please connect to Wi-Fi to use text reading."
+            )
             return
 
         frame = latest_frame[0]
@@ -244,8 +295,7 @@ def main():
     # ------------------------------------------------------------------
     # STEP 7 — Main frame loop
     # ------------------------------------------------------------------
-    frame_count     = 0
-    last_detections = []   # Reused between skipped frames — prevents box flicker
+    frame_count = 0
 
     try:
         while True:
@@ -259,24 +309,20 @@ def main():
 
             if current_mode[0] == 'od':
                 if frame_count % OD_FRAME_SKIP == 0:
-                    # Run both models with tracking
                     last_detections = run_dual_detection(frame)
-
-                    # Expire stale tracks, then decide what to announce
                     expire_lost_tracks()
                     process_detections(last_detections, frame.shape[1])
             else:
-                # In OCR mode — clear detections so boxes don't linger
                 last_detections = []
 
-            # Draw boxes every frame for smooth visuals
-            frame = draw_detections(frame, last_detections)
-
-            display_frame = draw_overlay(frame, current_mode[0], ocr_processing.is_set())
+            frame         = draw_detections(frame, last_detections)
+            display_frame = draw_overlay(
+                frame, current_mode[0], ocr_processing.is_set(), ocr_available[0]
+            )
             cv2.imshow("AiSee Smart Glasses", display_frame)
 
             key = cv2.waitKey(1) & 0xFF
-            if key == 27:   # ESC
+            if key == 27:
                 print("\n🛑 ESC pressed — shutting down...")
                 break
 
