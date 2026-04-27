@@ -21,7 +21,7 @@ except ImportError:
     os.system(
         'pip install --quiet '
         'requests gTTS Pillow opencv-python '
-        'pyttsx3 ultralytics RPi.GPIO'
+        'piper-tts ultralytics RPi.GPIO'
     )
     print("✓ Packages installed! Please run the script again.\n")
     sys.exit(0)

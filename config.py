@@ -147,7 +147,7 @@ DISTANCE_FAR        = 5.0   # "ahead" / "on your left/right"
 
 # How many seconds before the SAME track can be announced again.
 # Prevents constant repetition of a stationary object.
-ANNOUNCE_COOLDOWN = 6.0
+ANNOUNCE_COOLDOWN = 8.0
 
 # If a track disappears for this many seconds, it is forgotten.
 # When it re-enters the frame it will be announced fresh.
@@ -177,14 +177,3 @@ SETTLE_ANNOUNCE_COUNT = 3
 # Minimum distance change (metres) to wake up a settled track.
 # If a settled track's distance changes by more than this, it becomes active again.
 SETTLE_WAKEUP_DELTA = 0.8
-
-# =============================================================================
-# TTS CONFIGURATION (Piper)
-# =============================================================================
-
-# Piper TTS model path
-PIPER_MODEL_PATH = "/home/ab/Desktop/final script/en_US-amy-medium.onnx"
-
-# Bluetooth audio device for pipel (leave empty for default device)
-# Format: "bluez_output.XX_XX_XX_XX_XX_XX.1"
-BT_DEVICE = ""

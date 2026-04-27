@@ -2,34 +2,65 @@
 # Audio — Text-to-speech and audio playback utilities
 # =============================================================================
 #
-# Handles all audio output: TTS engine (Piper), speech worker thread, and audio playback.
+# Handles all audio output: TTS engine, speech worker thread, and audio playback.
 #
 # =============================================================================
 
 import os
 import time
+import wave
+import tempfile
 import threading
 import subprocess
-import tempfile
 from queue import Queue
 
-from config import PIPER_MODEL_PATH, BT_DEVICE
+from piper.voice import PiperVoice
+
+# =============================================================================
+# PIPER TTS CONFIGURATION
+# =============================================================================
+
+PIPER_MODEL_PATH = "/home/ab/Desktop/final script/en_US-amy-medium.onnx"
+BT_DEVICE        = "bluez_output.DF_F0_93_9C_67_B3.1"
+
+print("🔊 Loading Piper TTS voice model...")
+_piper_voice = PiperVoice.load(PIPER_MODEL_PATH)
+print("✓ Piper TTS ready!\n")
+
+
+def _piper_speak(text: str):
+    """Synthesize text with Piper and play via Bluetooth. Blocking."""
+    tmp_path = None
+    try:
+        chunks = list(_piper_voice.synthesize(text))
+        if not chunks:
+            print("⚠️  Piper produced no audio chunks.")
+            return
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_path = f.name
+
+        with wave.open(tmp_path, "wb") as wav_file:
+            wav_file.setnchannels(chunks[0].sample_channels)
+            wav_file.setsampwidth(chunks[0].sample_width)
+            wav_file.setframerate(chunks[0].sample_rate)
+            for chunk in chunks:
+                wav_file.writeframes(chunk.audio_int16_bytes)
+
+        subprocess.run(
+            ["paplay", f"--device={BT_DEVICE}", tmp_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception as e:
+        print(f"⚠️  Piper TTS error: {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 # Shared speech queue for cross-module communication
 speech_queue = Queue()
-
-# Lazy-loaded Piper voice
-_piper_voice = None
-
-
-def _get_piper_voice():
-    """Lazy-load the Piper voice."""
-    global _piper_voice
-    if _piper_voice is None:
-        from piper.voice import PiperVoice
-        _piper_voice = PiperVoice.load(PIPER_MODEL_PATH)
-    return _piper_voice
 
 
 def _play_audio(path: str):
@@ -45,47 +76,10 @@ def _play_audio(path: str):
     print("⚠️  No audio player found. Run: sudo apt install mpg123")
 
 
-def _speak_piper(text: str):
-    """
-    Speak text using Piper TTS.
-    Synthesizes speech to a temporary WAV file and plays it via paplay.
-    """
-    try:
-        voice = _get_piper_voice()
-        
-        # Synthesize to temporary WAV file
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            tmp_path = f.name
-
-        # Synthesize audio
-        chunks = list(voice.synthesize(text))
-        
-        # Write WAV file
-        import wave
-        with wave.open(tmp_path, "wb") as wav_file:
-            wav_file.setnchannels(chunks[0].sample_channels)
-            wav_file.setsampwidth(chunks[0].sample_width)
-            wav_file.setframerate(chunks[0].sample_rate)
-            for chunk in chunks:
-                wav_file.writeframes(chunk.audio_int16_bytes)
-
-        # Play via paplay (with optional Bluetooth device)
-        if BT_DEVICE:
-            subprocess.run(["paplay", f"--device={BT_DEVICE}", tmp_path], check=True)
-        else:
-            subprocess.run(["paplay", tmp_path], check=True)
-
-        # Cleanup
-        os.unlink(tmp_path)
-        
-    except Exception as e:
-        print(f"⚠️  Piper TTS error: {e}")
-
-
-# Backward compatibility alias
 def _speak_blocking(text: str, lang: str = "en"):
-    """Speak English text immediately using Piper (blocking)."""
-    _speak_piper(text)
+    """Speak English text immediately using Piper TTS (blocking)."""
+    print(f"🔊 Speaking: {text}")
+    _piper_speak(text)
 
 
 def speak_worker():
@@ -130,11 +124,7 @@ def speak_worker():
                         except Exception:
                             break
 
-                # Use Piper TTS
-                try:
-                    _speak_piper(message)
-                except Exception as e:
-                    print(f"⚠️  TTS error: {e}")
+                _piper_speak(message)
 
             else:
                 time.sleep(0.05)

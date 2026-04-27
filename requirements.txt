@@ -22,7 +22,7 @@ psutil==7.0.0
 pyparsing==3.2.4
 pypiwin32==223
 python-dateutil==2.9.0.post0
-pyttsx3==2.99
+piper-tts>=0.1.0
 pywin32==311
 PyYAML==6.0.2
 requests==2.32.5
